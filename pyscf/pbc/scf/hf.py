@@ -540,40 +540,16 @@ class SCF(mol_hf.SCF):
 
     @property
     def kpts(self):
-        if 'kpts' in self.__dict__:
-            # To handle the attribute kpt loaded from chkfile
-            self.kpts = self.__dict__.pop('kpts')
         return self.with_df.kpts
-    @kpts.setter
-    def kpts(self, x):
-        self.with_df.kpts = np.reshape(x, (-1,3))
-        if self.rsjk:
-            self.rsjk.kpts = self.with_df.kpts
 
     def build(self, cell=None):
         # To handle the attribute kpt or kpts loaded from chkfile
-        if 'kpts' in self.__dict__:
-            self.kpts = self.__dict__.pop('kpts')
-        elif 'kpt' in self.__dict__:
+        if 'kpt' in self.__dict__:
             self.kpt = self.__dict__.pop('kpt')
 
-        # "vcut_ws" precomputing is triggered by pbc.tools.pbc.get_coulG
-        #if self.exxdiv == 'vcut_ws':
-        #    if self.exx_built is False:
-        #        self.precompute_exx()
-        #    logger.info(self, 'WS alpha = %s', self.exx_alpha)
-
-        kpts = self.kpts
         if self.rsjk:
             if not np.all(self.rsjk.kpts == self.kpt):
-                self.rsjk = self.rsjk.__class__(cell, kpts)
-
-        # for GDF and MDF
-        with_df = self.with_df
-        if len(kpts) > 1 and getattr(with_df, '_j_only', False):
-            logger.warn(self, 'df.j_only cannot be used with k-point HF')
-            with_df._j_only = False
-            with_df.reset()
+                self.rsjk = self.rsjk.__class__(cell, self.kpt)
 
         if self.verbose >= logger.WARN:
             self.check_sanity()

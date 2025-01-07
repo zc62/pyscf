@@ -329,7 +329,8 @@ class _IntPPBuilder(Int3cBuilder):
             else:
                 lib.logger.warn(cell, 'cell.pseudo was specified but its elements %s '
                                 'were not found in the system.', cell._pseudo.keys())
-            vpploc = [0] * nkpts
+            nao = cell.nao
+            vpploc = np.zeros((nkpts, nao, nao))
             return vpploc
 
         rcut = self._estimate_rcut_3c1e(rs_cell, fake_cells)
@@ -571,6 +572,9 @@ class AFTDF(lib.StreamObject, AFTDFMixin):
         'cell', 'mesh', 'kpts', 'time_reversal_symmetry', 'blockdim',
     }
 
+    # to mimic molecular DF object
+    blockdim = getattr(__config__, 'pbc_df_df_DF_blockdim', 240)
+
     def __init__(self, cell, kpts=np.zeros((1,3))):
         self.cell = cell
         self.stdout = cell.stdout
@@ -579,9 +583,6 @@ class AFTDF(lib.StreamObject, AFTDFMixin):
         self.mesh = cell.mesh
         self.kpts = kpts
         self.time_reversal_symmetry = True
-
-        # to mimic molecular DF object
-        self.blockdim = getattr(__config__, 'pbc_df_df_DF_blockdim', 240)
 
         # The following attributes are not input options.
         self._rsh_df = {}  # Range separated Coulomb DF objects
