@@ -3,291 +3,309 @@
 '''
 Non-relativistic Kohn-Sham for NEO-DFT
 '''
+
 import numpy
-from pyscf import scf, dft, lib
+from pyscf import dft, lib
 from pyscf.lib import logger
-from pyscf.dft.numint import eval_ao, eval_rho, _scale_ao, _dot_ao_ao, _dot_ao_ao_sparse
-from pyscf.neo.hf import HF
-from pyscf.dft.gen_grid import NBINS
-from pyscf.qmmm.itrf import qmmm_for_scf
+from pyscf.dft.numint import (BLKSIZE, NBINS, eval_ao, eval_rho, _scale_ao,
+                              _dot_ao_ao, _dot_ao_ao_sparse)
+from pyscf.neo import hf
 
-def eval_xc_nuc(epc, rho_e, rho_n):
-    '''evaluate e_xc and v_xc of proton on a grid (epc17)'''
 
-    epc_type = None
-    if isinstance(epc, str):
-        epc_type = epc
-    elif isinstance(epc, dict):
-        if "epc_type" not in epc:
-            epc_type = '17-2'
+def eval_epc(epc, rho_e, rho_n):
+    '''Evaluate EPC energy and potentials for both components.
+
+    Args:
+        epc : str or dict
+            EPC functional specification. Can be '17-1', '17-2', '18-1', '18-2'
+            or a dict with 'epc_type' and parameters.
+        rho_e : ndarray
+            Electron density on grid points
+        rho_n : ndarray
+            Nuclear density on grid points
+
+    Returns:
+        exc : ndarray
+            EPC energy density
+        vxc_n : ndarray
+            Nuclear potential
+        vxc_e : ndarray
+            Electronic potential
+    '''
+    params = {
+        '17-1': (2.35, 2.4, 3.2),
+        '17-2': (2.35, 2.4, 6.6),
+        '18-1': (1.8, 0.1, 0.03),
+        '18-2': (3.9, 0.5, 0.06)
+    }
+    # Parse EPC type and parameters
+    if isinstance(epc, dict):
+        epc_type = epc.get('epc_type', '17-2')
+        if epc_type in ('17', '18'):
+            a = epc['a']
+            b = epc['b']
+            c = epc['c']
         else:
-            epc_type = epc["epc_type"]
+            if epc_type not in params:
+                raise ValueError(f'Unknown EPC type: {epc_type}')
+            a, b, c = params[epc_type]
     else:
-        raise TypeError('Only string or dictionary is allowed for epc')
-
-    if epc_type == '17-1':
-        a = 2.35
-        b = 2.4
-        c = 3.2
-    elif epc_type == '17-2':
-        a = 2.35
-        b = 2.4
-        c = 6.6
-    elif epc_type == '18-1':
-        a = 1.8
-        b = 0.1
-        c = 0.03
-    elif epc_type == '18-2':
-        a = 3.9
-        b = 0.5
-        c = 0.06
-    elif epc_type == '17' or epc_type == '18':
-        a = epc["a"]
-        b = epc["b"]
-        c = epc["c"]
-    else:
-        raise ValueError('Unsupported type of epc %s', epc_type)
-
-    if epc_type.startswith('17'):
-        rho_product = numpy.multiply(rho_e, rho_n)
-        denominator = a - b * numpy.sqrt(rho_product) + c * rho_product
-        exc = - numpy.multiply(rho_e, 1 / denominator)
-
-        denominator = numpy.square(denominator)
-        numerator = -a * rho_e + numpy.multiply(numpy.sqrt(rho_product), rho_e) * b * 0.5
-        vxc = numpy.multiply(numerator, 1 / denominator)
-    elif epc_type.startswith('18'):
-        rho_e_cr = numpy.cbrt(rho_e)
-        rho_n_cr = numpy.cbrt(rho_n)
-        beta = rho_e_cr + rho_n_cr
-        denominator = a - b * beta**3 + c * beta**6
-        exc = - numpy.multiply(rho_e, 1 / denominator)
-
-        denominator = numpy.square(denominator)
-        numerator = a * rho_e - b * numpy.multiply(rho_e_cr**4, numpy.square(beta))\
-                    + c * numpy.multiply(numpy.multiply(rho_e, beta**5), rho_e_cr - rho_n_cr)
-        vxc = - numpy.multiply(numerator, 1 / denominator)
-    else:
-        raise ValueError('Unsupported type of epc %s', epc_type)
-
-    return exc, vxc
-
-def eval_xc_elec(epc, rho_e, rho_n):
-    '''evaluate v_xc of electrons on a grid (only the epc part)'''
-
-    epc_type = None
-    if isinstance(epc, str):
         epc_type = epc
-    elif isinstance(epc, dict):
-        if "epc_type" not in epc:
-            epc_type = '17-2'
-        else:
-            epc_type = epc["epc_type"]
-    else:
-        raise TypeError('Only string or dictionary is allowed for epc')
+        if epc_type not in params:
+            raise ValueError(f'Unknown EPC type: {epc_type}')
+        a, b, c = params[epc_type]
 
-    if epc_type == '17-1':
-        a = 2.35
-        b = 2.4
-        c = 3.2
-    elif epc_type == '17-2':
-        a = 2.35
-        b = 2.4
-        c = 6.6
-    elif epc_type == '18-1':
-        a = 1.8
-        b = 0.1
-        c = 0.03
-    elif epc_type == '18-2':
-        a = 3.9
-        b = 0.5
-        c = 0.06
-    elif epc_type == '17' or epc_type == '18':
-        a = epc["a"]
-        b = epc["b"]
-        c = epc["c"]
-    else:
-        raise ValueError('Unsupported type of epc %s', epc_type)
-
+    # Evaluate energy and potentials based on functional type
     if epc_type.startswith('17'):
-        rho_product = numpy.multiply(rho_e, rho_n)
-        denominator = a - b * numpy.sqrt(rho_product) + c * rho_product
-        denominator = numpy.square(denominator)
-        numerator = -a * rho_n + numpy.multiply(numpy.sqrt(rho_product), rho_n) * b * 0.5
-        vxc = numpy.multiply(numerator, 1 / denominator)
-    elif epc_type.startswith('18'):
-        rho_e_cr = numpy.cbrt(rho_e)
-        rho_n_cr = numpy.cbrt(rho_n)
-        beta = rho_e_cr + rho_n_cr
-        denominator = a - b * beta**3 + c * beta**6
-        denominator = numpy.square(denominator)
-        numerator = a * rho_n - b * numpy.multiply(rho_n_cr**4, numpy.square(beta))\
-                    + c * numpy.multiply(numpy.multiply(rho_n, beta**5), rho_n_cr - rho_e_cr)
-        vxc = - numpy.multiply(numerator, 1 / denominator)
+        # EPC17 form
+        rho_prod = numpy.multiply(rho_e, rho_n)
+        rho_sqrt = numpy.sqrt(rho_prod)
+        denom = a - b * rho_sqrt + c * rho_prod
+        denom2 = numpy.square(denom)
+
+        # Energy density
+        exc = -rho_e / denom
+
+        # Nuclear potential
+        numer_n = -a * rho_e + 0.5 * b * rho_e * rho_sqrt
+        vxc_n = numer_n / denom2
+
+        # Electronic potential
+        numer_e = -a * rho_n + 0.5 * b * rho_n * rho_sqrt
+        vxc_e = numer_e / denom2
     else:
-        raise ValueError('Unsupported type of epc %s', epc_type)
+        # EPC18 form
+        rho_e_cbrt = numpy.cbrt(rho_e)
+        rho_n_cbrt = numpy.cbrt(rho_n)
+        beta = rho_e_cbrt + rho_n_cbrt
+        beta2 = numpy.square(beta)
+        beta3 = beta * beta2
+        beta5 = beta2 * beta3
+        beta6 = beta3 * beta3
+        denom = a - b * beta3 + c * beta6
+        denom2 = numpy.square(denom)
 
-    return vxc
+        # Energy density
+        exc = -rho_e / denom
 
+        # Nuclear potential
+        numer_n = a * rho_e - b * rho_e_cbrt**4 * beta2 \
+                + c * numpy.multiply(rho_e * beta5, rho_e_cbrt - rho_n_cbrt)
+        vxc_n = -numer_n / denom2
 
-class KS(HF):
+        # Electronic potential
+        numer_e = a * rho_n - b * rho_n_cbrt**4 * beta2 \
+                + c * numpy.multiply(rho_n * beta5, rho_n_cbrt - rho_e_cbrt)
+        vxc_e = -numer_e / denom2
+
+    return exc, vxc_n, vxc_e
+
+class InteractionCorrelation(hf.InteractionCoulomb):
+    '''Inter-component Coulomb and correlation'''
+    def __init__(self, *args, epc=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.epc = epc
+
+    def _need_epc(self):
+        if self.epc is None:
+            return False
+        if self.mf1_type == 'e':
+            if self.mf2_type.startswith('n'):
+                if self.mf2.mol.super_mol.atom_pure_symbol(self.mf2.mol.atom_index) == 'H':
+                    if isinstance(self.epc, str) or \
+                            self.mf2.mol.atom_index in self.epc['epc_nuc']:
+                        return True
+        if self.mf2_type == 'e':
+            if self.mf1_type.startswith('n'):
+                if self.mf1.mol.super_mol.atom_pure_symbol(self.mf1.mol.atom_index) == 'H':
+                    if isinstance(self.epc, str) or \
+                            self.mf1.mol.atom_index in self.epc['epc_nuc']:
+                        return True
+        return False
+
+    def get_vint(self, dm, *args, **kwargs):
+        vj = super().get_vint(dm, *args, **kwargs)
+        # For nuclear initial guess, use Coulomb only
+        if not (self.mf1_type in dm and self.mf2_type in dm and self._need_epc()):
+            return vj
+
+        if self.mf1_type == 'e':
+            mf_e, dm_e = self.mf1, dm[self.mf1_type]
+            mf_n, dm_n = self.mf2, dm[self.mf2_type]
+            n_type = self.mf2_type
+        else:
+            mf_e, dm_e = self.mf2, dm[self.mf2_type]
+            mf_n, dm_n = self.mf1, dm[self.mf1_type]
+            n_type = self.mf1_type
+
+        grids = mf_e.grids
+        ni = mf_e._numint
+
+        nao_e = mf_e.mol.nao
+        nao_n = mf_n.mol.nao
+        ao_loc_e = mf_e.mol.ao_loc_nr()
+        ao_loc_n = mf_n.mol.ao_loc_nr()
+
+        exc_sum = 0
+        vxc_e = numpy.zeros((nao_e, nao_e))
+        vxc_n = numpy.zeros((nao_n, nao_n))
+
+        if dm_e.ndim > 2:
+            dm_e = dm_e[0] + dm_e[1]
+
+        cutoff = grids.cutoff * 1e2
+        nbins = NBINS * 2 - int(NBINS * numpy.log(cutoff) / numpy.log(grids.cutoff))
+        pair_mask_e = mf_e.mol.get_overlap_cond() < -numpy.log(ni.cutoff)
+
+        non0tab_n = ni.make_mask(mf_n.mol, grids.coords, grids.weights.size)
+
+        aow = None
+        p1 = 0
+        for ao_e, mask_e, weight, coords in ni.block_loop(mf_e.mol, grids, nao_e):
+            p0, p1 = p1, p1 + weight.size
+            mask_n = non0tab_n[p0//BLKSIZE:p1//BLKSIZE+1]
+
+            # Skip if no nuclear basis functions in this block
+            if numpy.all(mask_n == 0):
+                continue
+
+            rho_e = eval_rho(mf_e.mol, ao_e, dm_e, mask_e)
+            rho_e[rho_e < 0] = 0  # Ensure non-negative density
+
+            ao_n = eval_ao(mf_n.mol, coords, non0tab=mask_n)
+            rho_n = eval_rho(mf_n.mol, ao_n, dm_n)
+            rho_n[rho_n < 0] = 0  # Ensure non-negative density
+
+            exc, vxc_n_grid, vxc_e_grid = eval_epc(self.epc, rho_e, rho_n)
+
+            den = rho_n * weight
+            exc_sum += numpy.dot(den, exc)
+
+            # x0.5 for vmat + vmat.T
+            aow = _scale_ao(ao_n, 0.5 * weight * vxc_n_grid, out=aow)
+            vxc_n += _dot_ao_ao(mf_n.mol, ao_n, aow, mask_n,
+                                (0, mf_n.mol.nbas), ao_loc_n)
+            _dot_ao_ao_sparse(ao_e, ao_e, 0.5 * weight * vxc_e_grid,
+                              nbins, mask_e, pair_mask_e, ao_loc_e, 1, vxc_e)
+
+        vxc_n = vxc_n + vxc_n.conj().T
+        vxc_e = vxc_e + vxc_e.conj().T
+
+        vxc = {}
+        vxc['e'] = lib.tag_array(vj['e'] + vxc_e, exc=exc_sum, vj=vj['e'])
+        vxc[n_type] = lib.tag_array(vj[n_type] + vxc_n, exc=exc_sum, vj=vj[n_type])
+        return vxc
+
+class KS(hf.HF):
     '''
     Examples::
 
     >>> from pyscf import neo
-    >>> mol = neo.Mole()
-    >>> mol.build(atom='H 0 0 0; F 0 0 0.917', quantum_nuc=[0], basis='ccpvdz', nuc_basis='pb4d')
-    >>> mf = neo.KS(mol, epc='17-2')
+    >>> mol = neo.M(atom='H 0 0 0; F 0 0 0.917', quantum_nuc=[0], basis='ccpvdz', nuc_basis='pb4d')
+    >>> mf = neo.KS(mol, xc='b3lyp5', epc='17-2')
     >>> mf.max_cycle = 100
     >>> mf.scf()
     -100.38833734158459
     '''
 
-    def __init__(self, mol, epc=None, **kwargs):
-        HF.__init__(self, mol, **kwargs)
-        self.epc = epc # electron-proton correlation: '17-1' or '17-2' can be used
+    def __init__(self, mol, xc, *args, epc=None, **kwargs):
+        # NOTE: To prevent user error, require xc to be explicitly provided
+        super().__init__(mol, *args, **kwargs)
+        self.xc_e = xc # Electron xc functional
+        self.epc = epc # Electron-proton correlation
 
-        # set up Hamiltonian for electrons
-        if self.unrestricted:
-            self.mf_elec = dft.UKS(mol.elec)
-        else:
-            self.mf_elec = dft.RKS(mol.elec)
-        if 'df_ee' in kwargs:
-            df_ee = kwargs['df_ee']
-        else:
-            df_ee = False
-        if 'auxbasis_e' in kwargs:
-            auxbasis_e = kwargs['auxbasis_e']
-        else:
-            auxbasis_e = None
-        if 'only_dfj_e' in kwargs:
-            only_dfj_e = kwargs['only_dfj_e']
-        else:
-            only_dfj_e = False
-        if df_ee:
-            self.mf_elec = self.mf_elec.density_fit(auxbasis=auxbasis_e,
-                                                    only_dfj=only_dfj_e)
-        if self.mol.mm_mol is not None:
-            self.mf_elec = qmmm_for_scf(self.mf_elec, self.mol.mm_mol)
-        # need to repeat these lines because self.mf_elec got overwritten
-        self.mf_elec.xc = 'b3lyp' # use b3lyp as the default xc functional for electrons
-        self.mf_elec.get_hcore = self.get_hcore_elec
-        self.mf_elec.hcore_static = None
-        if self.epc is not None:
-            self.mf_elec.get_veff = self.get_veff_elec_epc
-        if mol.elec.nhomo is not None:
-            self.mf_elec.get_occ = self.get_occ_elec(self.mf_elec)
+        for t, comp in self.mol.components.items():
+            if not t.startswith('n'):
+                if self.unrestricted:
+                    mf = dft.UKS(comp, xc=self.xc_e)
+                else:
+                    mf = dft.RKS(comp, xc=self.xc_e)
+                if self.df_ee:
+                    mf = mf.density_fit(auxbasis=self.auxbasis_e, only_dfj=self.only_dfj_e)
+                charge = 1.
+                if t.startswith('p'):
+                    charge = -1.
+                self.components[t] = hf.general_scf(mf, charge=charge)
+        self.interactions = hf.generate_interactions(self.components, InteractionCorrelation,
+                                                     self.max_memory, epc=self.epc)
 
-        # set up Hamiltonian for each quantum nuclei
-        for i in range(mol.nuc_num):
-            ia = self.mol.nuc[i].atom_index
-            # only support electron-proton correlation
-            if self.epc is not None and self.mol.atom_pure_symbol(ia) == 'H' \
-                and (isinstance(self.epc, str) or ia in self.epc['epc_nuc']):
-                self.mf_nuc[i] = dft.RKS(self.mol.nuc[i])
-                mf_nuc = self.mf_nuc[i]
-                # need to repeat these lines because self.mf_nuc got overwritten
-                mf_nuc.occ_state = 0 # for Delta-SCF
-                mf_nuc.get_occ = self.get_occ_nuc(mf_nuc)
-                mf_nuc.get_hcore = self.get_hcore_nuc(mf_nuc)
-                mf_nuc.hcore_static = None
-                mf_nuc.get_veff = self.get_veff_nuc_epc
-                mf_nuc.energy_qmnuc = self.energy_qmnuc
-
-    def get_veff_nuc_epc(self, mol, dm, dm_last=None, vhf_last=None, hermi=1):
-        '''Add EPC contribution to nuclear veff'''
-        nao = mol.nao
-        ao_loc = mol.ao_loc_nr()
-        nnuc = 0
-        excsum = 0
-        vmat = numpy.zeros((nao, nao))
-
-        grids = self.mf_elec.grids
-        ni = self.mf_elec._numint
-
-        aow = None
-        for ao, mask, weight, coords in ni.block_loop(mol, grids, nao):
-            aow = numpy.ndarray(ao.shape, order='F', buffer=aow)
-            ao_elec = eval_ao(self.mol.elec, coords)
-            if self.dm_elec.ndim > 2:
-                rho_elec = eval_rho(self.mol.elec, ao_elec, self.dm_elec[0] + self.dm_elec[1])
+    def energy_elec(self, dm=None, h1e=None, vhf=None, vint=None):
+        if dm is None: dm = self.make_rdm1()
+        if h1e is None: h1e = self.get_hcore()
+        if vhf is None: vhf = self.get_veff(self.mol, dm)
+        if vint is None: vint = self.get_vint(self.mol, dm)
+        self.scf_summary['e1'] = 0
+        self.scf_summary['coul'] = 0
+        self.scf_summary['exc'] = 0
+        e_elec = 0
+        e2 = 0
+        for t, comp in self.components.items():
+            logger.debug(self, f'Component: {t}')
+            # Assign epc correlation energy to electrons
+            if hasattr(vhf[t], 'exc') and hasattr(vint[t], 'exc'):
+                vhf[t].exc += vint[t].exc
+            if hasattr(vint[t], 'vj'):
+                vj = vint[t].vj
             else:
-                rho_elec = eval_rho(self.mol.elec, ao_elec, self.dm_elec)
-            ao_nuc = eval_ao(mol, coords)
-            rho_nuc = eval_rho(mol, ao_nuc, dm)
-            rho_nuc[rho_nuc<0.] = 0.
-            rho_elec[rho_elec<0.] = 0.
-            exc, vxc = eval_xc_nuc(self.epc, rho_elec, rho_nuc)
-            den = rho_nuc * weight
-            nnuc += den.sum()
-            excsum += numpy.dot(den, exc)
-            # times 0.5 because vmat + vmat.T
-            aow = _scale_ao(ao_nuc, 0.5 * weight * vxc, out=aow)
-            vmat += _dot_ao_ao(mol, ao_nuc, aow, mask, (0, mol.nbas), ao_loc)
-        logger.debug(self, 'The number of nuclei: %.5f', nnuc)
-        vmat += vmat.conj().T
-        # attach E_ep to vmat to retrieve later
-        vmat = lib.tag_array(vmat, exc=excsum, ecoul=0, vj=0, vk=0)
-        return vmat
+                vj = vint[t]
+            # vj acts as if a spin-insensitive one-body Hamiltonian
+            # .5 to remove double-counting
+            e_elec_t, e2_t = comp.energy_elec(dm[t], h1e[t] + vj * .5, vhf[t])
+            e_elec += e_elec_t
+            e2 += e2_t
+            self.scf_summary['e1'] += comp.scf_summary['e1']
+            # Nucleus is RHF and its scf_summary does not have coul or exc
+            if hasattr(vhf[t], 'exc'):
+                self.scf_summary['coul'] += comp.scf_summary['coul']
+                self.scf_summary['exc'] += comp.scf_summary['exc']
+        return e_elec, e2
 
-    def get_veff_elec_epc(self, mol, dm, dm_last=None, vhf_last=None, hermi=1):
-        '''Add EPC contribution to electronic veff'''
-        nao = mol.nao
-        ao_loc = mol.ao_loc_nr()
-        vmat = numpy.zeros((nao, nao))
-        grids = self.mf_elec.grids
-        ni = self.mf_elec._numint
-        cutoff = grids.cutoff * 1e2
-        nbins = NBINS * 2 - int(NBINS * numpy.log(cutoff) / numpy.log(grids.cutoff))
-        pair_mask = mol.get_overlap_cond() < -numpy.log(ni.cutoff)
-        for i in range(self.mol.nuc_num):
-            ia = self.mol.nuc[i].atom_index
-            if self.mol.atom_pure_symbol(ia) == 'H' \
-                and (isinstance(self.epc, str) or ia in self.epc['epc_nuc']):
-                for ao, mask, weight, coords in ni.block_loop(mol, grids, nao):
-                    if dm.ndim > 2:
-                        rho_elec = eval_rho(mol, ao, dm[0] + dm[1])
+    def get_vint(self, mol=None, dm=None):
+        '''Inter-type Coulomb and possible epc'''
+        if mol is None: mol = self.mol
+        if dm is None: dm = self.make_rdm1()
+        vint = {}
+        for t in self.components.keys():
+            vint[t] = 0
+        for t_pair, interaction in self.interactions.items():
+            v = interaction.get_vint(dm)
+            for t in t_pair:
+                # Take care of tag_array, accumulate exc and vj
+                v_has_tag = hasattr(v[t], 'exc')
+                vint_has_tag = hasattr(vint[t], 'exc')
+                if v_has_tag:
+                    if vint_has_tag:
+                        exc = vint[t].exc + v[t].exc
+                        vj = vint[t].vj + v[t].vj
                     else:
-                        rho_elec = eval_rho(mol, ao, dm)
-                    ao_nuc = eval_ao(self.mol.nuc[i], coords)
-                    rho_nuc = eval_rho(self.mol.nuc[i], ao_nuc, self.dm_nuc[i])
-                    rho_nuc[rho_nuc<0.] = 0.
-                    rho_elec[rho_elec<0.] = 0.
-                    vxc_i = eval_xc_elec(self.epc, rho_elec, rho_nuc)
-                    wv = weight * vxc_i
-                    # times 0.5 because vmat + vmat.T
-                    _dot_ao_ao_sparse(ao, ao, 0.5*wv, nbins, mask, pair_mask, ao_loc, 1, vmat)
-        vmat += vmat.conj().T
-        if dm.ndim > 2:
-            veff = dft.uks.get_veff(self.mf_elec, mol, dm, dm_last, vhf_last, hermi)
-        else:
-            veff = dft.rks.get_veff(self.mf_elec, mol, dm, dm_last, vhf_last, hermi)
-        vxc = lib.tag_array(veff + vmat, ecoul=veff.ecoul, exc=veff.exc, vj=veff.vj, vk=veff.vk)
-        return vxc
-
-    def energy_qmnuc(self, mf_nuc, h1n, dm_nuc, veff_n=None):
-        '''energy of quantum nuclei by NEO-DFT'''
-        n1 = numpy.einsum('ij,ji', h1n, dm_nuc)
-        ia = mf_nuc.mol.atom_index
-        if self.mol.atom_pure_symbol(ia) == 'H' and self.epc is not None \
-            and (isinstance(self.epc, str) or ia in self.epc['epc_nuc']):
-            if veff_n is None:
-                veff_n = mf_nuc.get_veff(mf_nuc.mol, dm_nuc)
-            n1 += veff_n.exc
-        logger.debug(self, 'Energy of %s (%3d): %s', self.mol.atom_symbol(ia), ia, n1)
-        return n1
+                        exc = v[t].exc
+                        vj = v[t].vj
+                    vint[t] = lib.tag_array(vint[t] + v[t], exc=exc, vj=vj)
+                else:
+                    if vint_has_tag:
+                        vint[t] = lib.tag_array(vint[t] + v[t], exc=vint[t].exc, vj=vint[t].vj + v[t])
+                    else:
+                        vint[t] += v[t]
+        return vint
 
     def reset(self, mol=None):
         '''Reset mol and relevant attributes associated to the old mol object'''
+        old_keys = sorted(self.components.keys())
         super().reset(mol=mol)
-        # point to correct ``self'' for overriden functions
-        if self.epc is not None:
-            self.mf_elec.get_veff = self.get_veff_elec_epc
-            for i in range(mol.nuc_num):
-                ia = self.mol.nuc[i].atom_index
-                # only support electron-proton correlation
-                if self.mol.atom_pure_symbol(ia) == 'H' \
-                    and (isinstance(self.epc, str) or ia in self.epc['epc_nuc']):
-                    mf_nuc = self.mf_nuc[i]
-                    mf_nuc.get_veff = self.get_veff_nuc_epc
+        if old_keys != sorted(self.components.keys()):
+            # quantum nuc is different, need to rebuild
+            for t, comp in self.mol.components.items():
+                if not t.startswith('n'):
+                    if self.unrestricted:
+                        mf = dft.UKS(comp, xc=self.xc_e)
+                    else:
+                        mf = dft.RKS(comp, xc=self.xc_e)
+                    if self.df_ee:
+                        mf = mf.density_fit(auxbasis=self.auxbasis_e, only_dfj=self.only_dfj_e)
+                    charge = 1.
+                    if t.startswith('p'):
+                        charge = -1.
+                    self.components[t] = general_scf(mf, charge=charge)
+            self.interactions = generate_interactions(self.components, InteractionCorrelation,
+                                                      self.max_memory, epc=self.epc)
         return self

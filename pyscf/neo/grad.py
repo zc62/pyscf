@@ -11,7 +11,7 @@ from pyscf.lib import logger
 from pyscf.scf import hf
 from pyscf.scf.jk import get_jk
 from pyscf.dft.numint import eval_ao, eval_rho, _scale_ao
-from pyscf.neo.ks import eval_xc_nuc, eval_xc_elec
+from pyscf.neo.ks import eval_epc
 from pyscf.grad.rks import _d1_dot_
 from pyscf.qmmm.itrf import qmmm_grad_for_scf
 import warnings
