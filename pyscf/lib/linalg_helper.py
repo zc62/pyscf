@@ -28,6 +28,7 @@ import scipy.linalg
 from pyscf.lib import logger
 from pyscf.lib import numpy_helper
 from pyscf.lib import misc
+from pyscf.lib import diis
 from pyscf.lib.exceptions import LinearDependencyError
 from pyscf import __config__
 
@@ -1509,6 +1510,275 @@ def _normalize_xt_(xt, xs, threshold, dot):
     return out, norm_min
 
 
+def rmm_diis(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
+             lindep=DAVIDSON_LINDEP, max_memory=MAX_MEMORY,
+             dot=numpy.dot, callback=None,
+             nroots=1, lessio=False, pick=None, verbose=logger.WARN,
+             follow_state=FOLLOW_STATE):
+    """RMM-DIIS diagonalization wrapper with the same user-facing API as
+    :func:`davidson`.
+
+    This wrapper accepts a single-vector matvec ``aop(x)`` and forwards to the
+    batched solver :func:`rmm_diis1`, exactly like :func:`davidson` forwards to
+    :func:`davidson1`.
+
+    The implemented RMM-DIIS is a *local per-root refinement* method.  Unlike
+    Davidson, it does not build one shared expanding subspace for all roots.
+    Each target root is iterated independently, with its own DIIS history.
+    This mirrors the mathematical structure of the note you supplied: there is
+    an outer loop over roots, and an inner loop over the local refinement of
+    each root.
+    """
+    e, x = rmm_diis1(lambda xs: [aop(x) for x in xs],
+                     x0, precond, tol, max_cycle, max_space, lindep,
+                     max_memory, dot, callback, nroots, lessio, pick, verbose,
+                     follow_state)[1:]
+    if nroots == 1:
+        return e[0], x[0]
+    else:
+        return e, x
+
+
+def _normalize_x_ax(x, ax, dot, lindep):
+    """Normalize a vector and its already-computed image under the operator.
+
+    In matrix-free eigensolvers we should avoid recomputing ``A x`` if it is
+    already available.  Whenever ``x`` is rescaled by a scalar, ``A x`` must be
+    rescaled by the same scalar.  This helper keeps the pair synchronized.
+    """
+    norm2 = dot(x.conj(), x).real
+    if norm2 <= lindep:
+        return None, None, 0.0
+    norm = numpy.sqrt(norm2)
+    return x / norm, ax / norm, norm
+
+
+def _rmm_diis_rr2(x, ax, d, ad, dot, lindep):
+    """2x2 Rayleigh--Ritz correction used by RMM-DIIS.
+
+    After DIIS extrapolation, we have a trial vector ``x``.  We then compute a
+    local correction direction ``d``:
+
+    * non-preconditioned RMM-DIIS: ``d = r`` where ``r = A x - e x``;
+    * preconditioned RMM-DIIS: ``d = K r``.
+
+    The new iterate is chosen as the *lowest Ritz vector* in
+    ``span(x, d)``.  This is the mathematically clean way to determine the
+    optimal mixing coefficient between the trial vector and the local
+    correction direction.  In other words, instead of guessing a scalar
+    ``beta`` in ``x + beta d``, we solve the projected 2x2 eigenvalue problem.
+    """
+    h2 = numpy.empty((2, 2), dtype=numpy.result_type(x, ax, d, ad))
+    s2 = numpy.empty((2, 2), dtype=numpy.result_type(x, d))
+
+    h2[0, 0] = dot(x.conj(), ax)
+    h2[0, 1] = dot(x.conj(), ad)
+    h2[1, 0] = h2[0, 1].conj()
+    h2[1, 1] = dot(d.conj(), ad)
+
+    s2[0, 0] = dot(x.conj(), x)
+    s2[0, 1] = dot(x.conj(), d)
+    s2[1, 0] = s2[0, 1].conj()
+    s2[1, 1] = dot(d.conj(), d)
+
+    try:
+        w, g = scipy.linalg.eigh(h2, s2)
+    except scipy.linalg.LinAlgError:
+        w, g, seig = safe_eigh(h2, s2, lindep=lindep)
+        if w.size == 0:
+            return x, ax, dot(x.conj(), ax).real
+
+    coeff = g[:, 0]
+    xnew = coeff[0] * x + coeff[1] * d
+    axnew = coeff[0] * ax + coeff[1] * ad
+    xnew, axnew, norm = _normalize_x_ax(xnew, axnew, dot, lindep)
+    if xnew is None:
+        return x, ax, dot(x.conj(), ax).real
+    enew = dot(xnew.conj(), axnew).real
+    return xnew, axnew, enew
+
+
+def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
+              lindep=DAVIDSON_LINDEP, max_memory=MAX_MEMORY,
+              dot=numpy.dot, callback=None,
+              nroots=1, lessio=False, pick=None, verbose=logger.WARN,
+              follow_state=FOLLOW_STATE, tol_residual=None):
+    """Residual Minimization Method accelerated by DIIS (RMM-DIIS).
+
+    This routine keeps the public signature of :func:`davidson1`, but its
+    algorithm is intentionally different.
+
+    Davidson is a *shared-subspace* method: all requested roots contribute
+    residual correction vectors to one common Ritz subspace.  RMM-DIIS, in the
+    formulation of the note you provided, is instead a *local per-root*
+    refinement method.  Each target root carries its own iterate and its own
+    DIIS history.  Therefore, it makes little sense to force all roots to march
+    in lockstep in one global outer cycle.  A fast root should be allowed to
+    stop as soon as its own convergence criterion is satisfied.
+
+    For each root j, this implementation performs the following local cycle:
+
+    1. Start from the current approximate eigenvector x_j.
+    2. Compute its Rayleigh quotient e_j = <x_j|A|x_j> and residual
+       r_j = A x_j - e_j x_j.
+    3. Push (x_j, r_j) into a PySCF :class:`diis.DIIS` object dedicated to
+       this root.  The DIIS object extrapolates a trial vector x_tilde.
+    4. Compute A x_tilde, then the residual r_tilde.
+    5. Define the local correction direction d_tilde:
+
+           * d_tilde = r_tilde                for the original method;
+           * d_tilde = precond(r_tilde, ...)  for the preconditioned variant.
+
+    6. Solve a 2x2 Rayleigh--Ritz problem in span(x_tilde, d_tilde).  This is
+       the mathematically clean way to determine the mixing coefficient between
+       the DIIS trial vector and the local correction direction.
+    7. Test convergence for this root only.  If converged, stop iterating this
+       root; otherwise continue.
+
+    The callback, if supplied, is called *inside the per-root inner loop* with
+    a dictionary that exposes the local quantities for the current root.
+    After all roots finish, a final callback is issued with arrays of per-root
+    iteration counts, DIIS history sizes, and termination reasons.
+    """
+    if isinstance(verbose, logger.Logger):
+        log = verbose
+    else:
+        log = logger.Logger(misc.StreamObject.stdout, verbose)
+
+    if tol_residual is None:
+        toloose = numpy.sqrt(tol)
+    else:
+        toloose = tol_residual
+
+    if callable(x0):
+        x0 = x0()
+    if isinstance(x0, numpy.ndarray) and x0.ndim == 1:
+        x0 = [x0]
+    if len(x0) < nroots:
+        raise ValueError('rmm_diis1 requires at least nroots initial guesses')
+
+    if pick is not None:
+        warnings.warn('rmm_diis1 ignores `pick`; roots follow the order of the initial guesses')
+    if follow_state:
+        warnings.warn('rmm_diis1 ignores `follow_state`')
+    if lessio:
+        warnings.warn('rmm_diis1 ignores `lessio`; all local steps use explicit matvecs')
+
+    # In this implementation, the original and preconditioned variants are
+    # selected by whether ``precond`` is None.
+    #
+    # * precond is None  -> original non-preconditioned RMM-DIIS
+    # * precond is not None -> preconditioned RMM-DIIS using d = K r
+    if precond is not None and (not callable(precond)):
+        precond = make_diag_precond(precond)
+
+    conv = numpy.zeros(nroots, dtype=bool)
+    e = numpy.zeros(nroots)
+    xs = [None] * nroots
+    root_iters = numpy.zeros(nroots, dtype=int)
+    root_hist = numpy.zeros(nroots, dtype=int)
+    root_reason = ['max_cycle reached'] * nroots
+
+    for j in range(nroots):
+        xj = numpy.array(x0[j], copy=True)
+        norm2 = dot(xj.conj(), xj).real
+        if norm2 <= lindep:
+            raise LinearDependenceError('Initial guess has near-zero norm in rmm_diis1')
+        xj /= numpy.sqrt(norm2)
+
+        # One DIIS object per root.  This mirrors the mathematical picture:
+        # each root has its own iterative subspace/history.
+        dj = diis.DIIS()
+        dj.space = max_space
+        dj.min_space = 1
+
+        axj = aop([xj])[0]
+        ej = dot(xj.conj(), axj).real
+        rj = axj - ej * xj
+
+        for icyc in range(max_cycle):
+            e_last = ej
+
+            # DIIS extrapolation step: x_tilde is an affine combination of the
+            # previous local iterates for this root, chosen so that the DIIS
+            # error vectors (here the eigen-residuals) cancel as much as
+            # possible.
+            xt = dj.update(xj, rj)
+            root_hist[j] = dj.get_num_vec()
+
+            # Explicitly evaluate A x_tilde because the DIIS object only
+            # extrapolates the vector itself, not its image under A.
+            axt = aop([xt])[0]
+            xt, axt, norm = _normalize_x_ax(xt, axt, dot, lindep)
+            if xt is None:
+                root_reason[j] = 'linear dependence in DIIS trial vector'
+                break
+
+            et = dot(xt.conj(), axt).real
+            rt = axt - et * xt
+            rt_norm = numpy.sqrt(dot(rt.conj(), rt).real)
+
+            # The DIIS trial vector may already have a very small residual.  In
+            # that case there is no meaningful second basis vector for the 2x2
+            # local Ritz step, so we simply keep the DIIS trial vector.
+            if rt_norm**2 > lindep:
+                if precond is not None:
+                    dt = precond(rt, et, xt)
+                else:
+                    dt = rt
+                adt = aop([dt])[0]
+                xj, axj, ej = _rmm_diis_rr2(xt, axt, dt, adt, dot, lindep)
+            else:
+                xj, axj, ej = xt, axt, et
+
+            rj = axj - ej * xj
+            rnorm = numpy.sqrt(dot(rj.conj(), rj).real)
+            de = ej - e_last
+            root_iters[j] = icyc + 1
+
+            if callable(callback):
+                callback({
+                    'root_index': j,
+                    'icyc': icyc,
+                    'xj': xj,
+                    'axj': axj,
+                    'ej': ej,
+                    'rj': rj,
+                    'rnorm': rnorm,
+                    'de': de,
+                    'diis_obj': dj,
+                    'history_length': dj.get_num_vec(),
+                    'is_preconditioned': (precond is not None),
+                })
+
+            if abs(de) < tol and rnorm < toloose:
+                conv[j] = True
+                root_reason[j] = 'tolerance reached'
+                break
+
+            if rt_norm**2 <= lindep:
+                root_reason[j] = 'local residual became linearly dependent'
+                break
+        else:
+            root_iters[j] = max_cycle
+
+        xs[j] = xj
+        e[j] = ej
+
+    if callable(callback):
+        callback({
+            'final_root_iterations': root_iters,
+            'final_root_history_lengths': root_hist,
+            'final_root_reasons': root_reason,
+            'conv': conv,
+            'e': e,
+            'x0': xs,
+            'is_preconditioned': (precond is not None),
+        })
+
+    return conv, e, list(xs)
+
+
 LinearDependenceError = LinearDependencyError
 
 class _Xlist(list):
@@ -1549,3 +1819,162 @@ class _Xlist(list):
     def pop(self, index):
         key = self.index.pop(index)
         del (self.scr_h5[str(key)])
+
+
+if __name__ == '__main__':
+    import time
+    import itertools
+
+    seed = 42
+    n = 500
+    nroots = 2
+    warmup_cycles_list = [16, 24, 32]
+    max_cycle = 300
+    max_space = 20
+    tol = 1e-10
+    tol_residual = None
+    lindep = DAVIDSON_LINDEP
+
+    rng = numpy.random.default_rng(seed)
+    a = rng.standard_normal((n, n))
+    a = (a + a.T) * 0.5
+    diag = a.diagonal().copy()
+
+    def aop(xs):
+        return [a.dot(x) for x in xs]
+
+    precond = make_diag_precond(diag)
+
+    t0 = time.perf_counter()
+    w_ref, v_ref = scipy.linalg.eigh(a)
+    t_ref = time.perf_counter() - t0
+    e_ref = w_ref[:nroots]
+    v_ref = v_ref[:, :nroots]
+
+    x0 = [rng.standard_normal(n) for _ in range(nroots)]
+
+    def residual_norms(evals, vecs):
+        vals = []
+        for ej, xj in zip(evals, vecs):
+            r = a.dot(xj) - ej * xj
+            vals.append(numpy.sqrt(numpy.dot(r.conj(), r).real))
+        return numpy.asarray(vals)
+
+    def overlap_match(vecs):
+        ov = abs(v_ref.conj().T.dot(numpy.asarray(vecs).T))
+        best_perm = None
+        best_score = -1
+        for perm in itertools.permutations(range(len(vecs))):
+            score = sum(ov[i, perm[i]] for i in range(len(vecs)))
+            if score > best_score:
+                best_score = score
+                best_perm = perm
+        matched = numpy.array([ov[i, best_perm[i]] for i in range(len(vecs))])
+        return best_perm, matched
+
+    def run_with_callback(solver, *args, **kwargs):
+        info = {
+            'iterations': 0,
+            'last_space': None,
+            'last_trial_count': None,
+            'last_history_length': None,
+            'root_iterations': None,
+            'root_history_lengths': None,
+            'root_reasons': None,
+        }
+        def cb(envs):
+            if 'final_root_iterations' in envs:
+                info['root_iterations'] = numpy.asarray(envs['final_root_iterations'])
+                info['root_history_lengths'] = numpy.asarray(envs['final_root_history_lengths'])
+                info['root_reasons'] = list(envs['final_root_reasons'])
+                return
+            info['iterations'] = max(info['iterations'], envs.get('icyc', -1) + 1)
+            info['last_space'] = envs.get('space', None)
+            xt = envs.get('xt', None)
+            if isinstance(xt, (list, tuple)):
+                info['last_trial_count'] = len(xt)
+            else:
+                info['last_trial_count'] = None
+            if 'history_length' in envs:
+                info['last_history_length'] = envs['history_length']
+            diis_obj = envs.get('diis_obj', None)
+            if diis_obj is not None:
+                info['last_history_length'] = diis_obj.get_num_vec()
+        kwargs = dict(kwargs)
+        kwargs['callback'] = cb
+        t0 = time.perf_counter()
+        conv, evals, vecs = solver(*args, **kwargs)
+        elapsed = time.perf_counter() - t0
+        return conv, evals, vecs, elapsed, info
+
+    print('Benchmark matrix: symmetric random matrix')
+    print(f'seed={seed}  n={n}  nroots={nroots}')
+    print(f'warmup_cycles_list={warmup_cycles_list}  max_cycle={max_cycle}  max_space={max_space}')
+    print(f'tol={tol}  tol_residual={tol_residual}  lindep={lindep}')
+    print()
+    print('Reference eigenvalues:')
+    print(e_ref)
+    print(f'Dense reference wall time (s): {t_ref:.6f}')
+    print()
+
+    for warmup_cycles in warmup_cycles_list:
+        print('=' * 78)
+        print(f'Warm-start benchmark with warmup_cycles={warmup_cycles}')
+        print('=' * 78)
+
+        conv_warm, e_warm, x_warm, t_warm, info_warm = run_with_callback(
+            davidson1, aop, [x.copy() for x in x0], precond,
+            tol=tol, max_cycle=warmup_cycles, max_space=max_space,
+            lindep=lindep, nroots=nroots, verbose=logger.WARN,
+            tol_residual=tol_residual)
+        conv_dav, e_dav, x_dav, t_dav, info_dav = run_with_callback(
+            davidson1, aop, [x.copy() for x in x_warm], precond,
+            tol=tol, max_cycle=max_cycle, max_space=max_space,
+            lindep=lindep, nroots=nroots, verbose=logger.WARN,
+            tol_residual=tol_residual)
+        conv_rmm, e_rmm, x_rmm, t_rmm, info_rmm = run_with_callback(
+            rmm_diis1, aop, [x.copy() for x in x_warm], None,
+            tol=tol, max_cycle=max_cycle, max_space=max_space,
+            lindep=lindep, nroots=nroots, verbose=logger.WARN,
+            tol_residual=tol_residual)
+        conv_rmmk, e_rmmk, x_rmmk, t_rmmk, info_rmmk = run_with_callback(
+            rmm_diis1, aop, [x.copy() for x in x_warm], precond,
+            tol=tol, max_cycle=max_cycle, max_space=max_space,
+            lindep=lindep, nroots=nroots, verbose=logger.WARN,
+            tol_residual=tol_residual)
+
+        def termination_string(conv, info, this_max_cycle):
+            if info['root_reasons'] is not None:
+                return info['root_reasons']
+            if numpy.all(conv):
+                return 'tolerance reached'
+            if info['iterations'] >= this_max_cycle:
+                return 'max_cycle reached'
+            return 'stopped early for another reason'
+
+        def report(name, conv, evals, vecs, elapsed, info, this_max_cycle):
+            perm, ovs = overlap_match(vecs)
+            errs_raw = numpy.abs(evals - e_ref)
+            errs_match = numpy.array([abs(evals[perm[i]] - e_ref[i]) for i in range(len(evals))])
+            print(f'{name}:')
+            print(f'  converged                = {conv}')
+            print(f'  iterations               = {info["iterations"]}')
+            print(f'  termination              = {termination_string(conv, info, this_max_cycle)}')
+            print(f'  per-root iterations      = {info["root_iterations"]}')
+            print(f'  last subspace/space info = {info["last_space"]}')
+            print(f'  last trial count         = {info["last_trial_count"]}')
+            print(f'  last history length      = {info["last_history_length"]}')
+            print(f'  per-root history lengths = {info["root_history_lengths"]}')
+            print(f'  eigenvalues (raw order)  = {evals}')
+            print(f'  abs err   (raw order)    = {errs_raw}')
+            print(f'  residual norms           = {residual_norms(evals, vecs)}')
+            print(f'  overlap-matched perm     = {perm}')
+            print(f'  abs err   (matched)      = {errs_match}')
+            print(f'  overlaps  (matched)      = {ovs}')
+            print(f'  wall time (s)            = {elapsed:.6f}')
+            print()
+
+        report('Warm-start Davidson results', conv_warm, e_warm, x_warm, t_warm, info_warm, warmup_cycles)
+        report('Davidson continuation results', conv_dav, e_dav, x_dav, t_dav, info_dav, max_cycle)
+        report('RMM-DIIS (non-preconditioned) polish results', conv_rmm, e_rmm, x_rmm, t_rmm, info_rmm, max_cycle)
+        report('RMM-DIIS (preconditioned) polish results', conv_rmmk, e_rmmk, x_rmmk, t_rmmk, info_rmmk, max_cycle)
