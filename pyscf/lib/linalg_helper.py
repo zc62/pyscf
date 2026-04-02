@@ -1656,6 +1656,10 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
         x0 = [x0]
     if len(x0) < nroots:
         raise ValueError('rmm_diis1 requires at least nroots initial guesses')
+    # Estimate whether DIIS histories should be kept in memory or on disk.
+    _incore = max_memory * 1e6 / x0[0].nbytes > (max_space * 2 + 4) * max(1, nroots)
+    log.debug1('rmm_diis max_cycle %d  max_space %d  max_memory %d  incore %s',
+               max_cycle, max_space, max_memory, _incore)
 
     if pick is not None:
         warnings.warn('rmm_diis1 ignores `pick`; roots follow the order of the initial guesses')
@@ -1688,7 +1692,7 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
 
         # One DIIS object per root.  This mirrors the mathematical picture:
         # each root has its own iterative subspace/history.
-        dj = diis.DIIS()
+        dj = diis.DIIS(incore=_incore)
         dj.space = max_space
         dj.min_space = 1
 
