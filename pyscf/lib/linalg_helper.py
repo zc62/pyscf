@@ -1635,10 +1635,8 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
     7. Test convergence for this root only.  If converged, stop iterating this
        root; otherwise continue.
 
-    The callback, if supplied, is called *inside the per-root inner loop* with
-    a dictionary that exposes the local quantities for the current root.
-    After all roots finish, a final callback is issued with arrays of per-root
-    iteration counts, DIIS history sizes, and termination reasons.
+    The callback, if supplied, is called with ``locals()`` inside the per-root
+    inner loop, matching the style of :func:`davidson1`.
     """
     if isinstance(verbose, logger.Logger):
         log = verbose
@@ -1656,6 +1654,7 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
         x0 = [x0]
     if len(x0) < nroots:
         raise ValueError('rmm_diis1 requires at least nroots initial guesses')
+
     # Estimate whether DIIS histories should be kept in memory or on disk.
     _incore = max_memory * 1e6 / x0[0].nbytes > (max_space * 2 + 4) * max(1, nroots)
     log.debug1('rmm_diis max_cycle %d  max_space %d  max_memory %d  incore %s',
@@ -1670,18 +1669,12 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
 
     # In this implementation, the original and preconditioned variants are
     # selected by whether ``precond`` is None.
-    #
-    # * precond is None  -> original non-preconditioned RMM-DIIS
-    # * precond is not None -> preconditioned RMM-DIIS using d = K r
     if precond is not None and (not callable(precond)):
         precond = make_diag_precond(precond)
 
     conv = numpy.zeros(nroots, dtype=bool)
     e = numpy.zeros(nroots)
     xs = [None] * nroots
-    root_iters = numpy.zeros(nroots, dtype=int)
-    root_hist = numpy.zeros(nroots, dtype=int)
-    root_reason = ['max_cycle reached'] * nroots
 
     for j in range(nroots):
         xj = numpy.array(x0[j], copy=True)
@@ -1708,14 +1701,14 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
             # error vectors (here the eigen-residuals) cancel as much as
             # possible.
             xt = dj.update(xj, rj)
-            root_hist[j] = dj.get_num_vec()
 
             # Explicitly evaluate A x_tilde because the DIIS object only
             # extrapolates the vector itself, not its image under A.
             axt = aop([xt])[0]
             xt, axt, norm = _normalize_x_ax(xt, axt, dot, lindep)
             if xt is None:
-                root_reason[j] = 'linear dependence in DIIS trial vector'
+                log.debug('rmm_diis root %d cycle %d  DIIS trial vector linearly dependent  hist=%d',
+                          j, icyc, dj.get_num_vec())
                 break
 
             et = dot(xt.conj(), axt).real
@@ -1738,47 +1731,26 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
             rj = axj - ej * xj
             rnorm = numpy.sqrt(dot(rj.conj(), rj).real)
             de = ej - e_last
-            root_iters[j] = icyc + 1
+
+            log.debug('rmm_diis root %d cycle %d  |r|= %4.3g  e= %s  max|de|= %4.3g  hist= %d',
+                      j, icyc, rnorm, ej, abs(de), dj.get_num_vec())
 
             if callable(callback):
-                callback({
-                    'root_index': j,
-                    'icyc': icyc,
-                    'xj': xj,
-                    'axj': axj,
-                    'ej': ej,
-                    'rj': rj,
-                    'rnorm': rnorm,
-                    'de': de,
-                    'diis_obj': dj,
-                    'history_length': dj.get_num_vec(),
-                    'is_preconditioned': (precond is not None),
-                })
+                callback(locals())
 
             if abs(de) < tol and rnorm < toloose:
                 conv[j] = True
-                root_reason[j] = 'tolerance reached'
+                log.debug('rmm_diis root %d converged  cycle %d  |r|= %4.3g  e= %s  max|de|= %4.3g',
+                          j, icyc, rnorm, ej, abs(de))
                 break
 
             if rt_norm**2 <= lindep:
-                root_reason[j] = 'local residual became linearly dependent'
+                log.debug('rmm_diis root %d cycle %d  local residual became linearly dependent  |r|= %4.3g  e= %s',
+                          j, icyc, rnorm, ej)
                 break
-        else:
-            root_iters[j] = max_cycle
 
         xs[j] = xj
         e[j] = ej
-
-    if callable(callback):
-        callback({
-            'final_root_iterations': root_iters,
-            'final_root_history_lengths': root_hist,
-            'final_root_reasons': root_reason,
-            'conv': conv,
-            'e': e,
-            'x0': xs,
-            'is_preconditioned': (precond is not None),
-        })
 
     return conv, e, list(xs)
 
@@ -1882,34 +1854,52 @@ if __name__ == '__main__':
             'last_space': None,
             'last_trial_count': None,
             'last_history_length': None,
-            'root_iterations': None,
-            'root_history_lengths': None,
-            'root_reasons': None,
+            'last_root_index': None,
+            'per_root_iterations': None,
+            'per_root_history_lengths': None,
         }
         def cb(envs):
-            if 'final_root_iterations' in envs:
-                info['root_iterations'] = numpy.asarray(envs['final_root_iterations'])
-                info['root_history_lengths'] = numpy.asarray(envs['final_root_history_lengths'])
-                info['root_reasons'] = list(envs['final_root_reasons'])
+            # Davidson-style callback path
+            if 'space' in envs:
+                info['iterations'] = max(info['iterations'], envs.get('icyc', -1) + 1)
+                info['last_space'] = envs.get('space', None)
+                xt = envs.get('xt', None)
+                if isinstance(xt, (list, tuple)):
+                    info['last_trial_count'] = len(xt)
+                else:
+                    info['last_trial_count'] = None
                 return
-            info['iterations'] = max(info['iterations'], envs.get('icyc', -1) + 1)
-            info['last_space'] = envs.get('space', None)
-            xt = envs.get('xt', None)
-            if isinstance(xt, (list, tuple)):
-                info['last_trial_count'] = len(xt)
-            else:
+
+            # RMM-DIIS path: callback(locals()) from inside the per-root inner loop.
+            j = envs.get('j', None)
+            icyc = envs.get('icyc', None)
+            dj = envs.get('dj', None)
+            if j is not None and icyc is not None:
+                info['last_root_index'] = j
+                info['iterations'] = max(info['iterations'], icyc + 1)
+                info['last_space'] = None
                 info['last_trial_count'] = None
-            if 'history_length' in envs:
-                info['last_history_length'] = envs['history_length']
-            diis_obj = envs.get('diis_obj', None)
-            if diis_obj is not None:
-                info['last_history_length'] = diis_obj.get_num_vec()
+                if dj is not None:
+                    info['last_history_length'] = dj.get_num_vec()
+                if info['per_root_iterations'] is None:
+                    info['per_root_iterations'] = {}
+                if info['per_root_history_lengths'] is None:
+                    info['per_root_history_lengths'] = {}
+                info['per_root_iterations'][j] = max(info['per_root_iterations'].get(j, 0), icyc + 1)
+                if dj is not None:
+                    info['per_root_history_lengths'][j] = dj.get_num_vec()
+
         kwargs = dict(kwargs)
         kwargs['callback'] = cb
         t0 = time.perf_counter()
         conv, evals, vecs = solver(*args, **kwargs)
         elapsed = time.perf_counter() - t0
         return conv, evals, vecs, elapsed, info
+
+    def _format_root_dict(dct, nroots):
+        if dct is None:
+            return None
+        return [dct.get(i, None) for i in range(nroots)]
 
     print('Benchmark matrix: symmetric random matrix')
     print(f'seed={seed}  n={n}  nroots={nroots}')
@@ -1948,8 +1938,6 @@ if __name__ == '__main__':
             tol_residual=tol_residual)
 
         def termination_string(conv, info, this_max_cycle):
-            if info['root_reasons'] is not None:
-                return info['root_reasons']
             if numpy.all(conv):
                 return 'tolerance reached'
             if info['iterations'] >= this_max_cycle:
@@ -1964,11 +1952,12 @@ if __name__ == '__main__':
             print(f'  converged                = {conv}')
             print(f'  iterations               = {info["iterations"]}')
             print(f'  termination              = {termination_string(conv, info, this_max_cycle)}')
-            print(f'  per-root iterations      = {info["root_iterations"]}')
+            print(f'  per-root iterations      = {_format_root_dict(info["per_root_iterations"], nroots)}')
+            print(f'  last root index          = {info["last_root_index"]}')
             print(f'  last subspace/space info = {info["last_space"]}')
             print(f'  last trial count         = {info["last_trial_count"]}')
             print(f'  last history length      = {info["last_history_length"]}')
-            print(f'  per-root history lengths = {info["root_history_lengths"]}')
+            print(f'  per-root history lengths = {_format_root_dict(info["per_root_history_lengths"], nroots)}')
             print(f'  eigenvalues (raw order)  = {evals}')
             print(f'  abs err   (raw order)    = {errs_raw}')
             print(f'  residual norms           = {residual_norms(evals, vecs)}')
