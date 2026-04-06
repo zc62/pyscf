@@ -241,7 +241,7 @@ def kernel(h1e, eri, norb, nelec, ecore=0):
     e, c = lib.davidson(hop, ci0.reshape(-1), precond)
     return e+ecore
 
-def kernel_2(h1e, eri, norb, nelec, ecore=0):
+def kernel_2(h1e, eri, norb, nelec, ecore=0, solver='davidson'):
     if isinstance(nelec, (int, numpy.integer)):
         nelecb = nelec//2
         neleca = nelec - nelecb
@@ -263,7 +263,10 @@ def kernel_2(h1e, eri, norb, nelec, ecore=0):
         return hc.reshape(-1)
     hdiag = make_hdiag(h1e, eri, norb, nelec)
     precond = lambda x, e, *args: x/(hdiag-e+1e-4)
-    e, c = lib.davidson(hop, ci0.reshape(-1), precond)
+    if solver.lower() == 'davidson':
+        e, c = lib.davidson(hop, ci0.reshape(-1), precond)
+    else:
+        e, c = lib.rmm_diis(hop, ci0.reshape(-1), precond)
     return e+ecore
 
 if __name__ == '__main__':
@@ -290,4 +293,7 @@ if __name__ == '__main__':
     #e1 = kernel((h1e_a, h1e_b), (eri_aa, eri_ab, eri_bb), norb, nelec, ecore=mf.energy_nuc())
     e1 = kernel_2((h1e_a, h1e_b), (eri_aa, eri_ab, eri_bb), norb, nelec, ecore=mf.energy_nuc())
     from pyscf import fci
-    print(e1, e1 - fci.FCI(mf).kernel()[0])
+    e1_ref = fci.FCI(mf).kernel()[0]
+    print(e1, e1 - e1_ref)
+    e1 = kernel_2((h1e_a, h1e_b), (eri_aa, eri_ab, eri_bb), norb, nelec, ecore=mf.energy_nuc(), solver='rmm_diis')
+    print(e1, e1 - e1_ref)

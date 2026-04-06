@@ -260,7 +260,8 @@ def make_rdiag(r1, norb, nparticle):
 def kernel(h1, g2, norb, nparticle, ecore=0, ci0=None, hdiag=None, nroots=1,
            r1=None, rdiag=None, f0=None, conv_tol=1e-12, lindep=1e-14,
            max_cycle=250, max_space=24, max_memory=260000, verbose=logger.DEBUG1,
-           constraint_start_space=4, auto_bounds=True, gtol=1e-12, rtol=1e-12):
+           constraint_start_space=4, auto_bounds=True, gtol=1e-12, rtol=1e-12,
+           solver='davidson'):
     if isinstance(verbose, logger.Logger):
         log = verbose
     else:
@@ -296,17 +297,31 @@ def kernel(h1, g2, norb, nparticle, ecore=0, ci0=None, hdiag=None, nroots=1,
             return hc.reshape(-1)
         precond = lambda x, e, *args: x/(hdiag-e+1e-4)
         t0 = logger.perf_counter()
-        converged, e, c = lib.davidson1(lambda xs: [hop(x) for x in xs],
-                                        ci0, precond, tol=conv_tol, lindep=lindep,
-                                        max_cycle=max_cycle, max_space=max_space,
-                                        max_memory=max_memory, nroots=nroots,
-                                        verbose=verbose)
-        log.debug(f'davidson: {logger.perf_counter() - t0} seconds')
-        if converged[0]:
-            log.note(f'FCI Davidson converged! Energy = {e[0]+ecore:.15g}')
+        if solver.lower() == 'davidson':
+            converged, e, c = lib.davidson1(lambda xs: [hop(x) for x in xs],
+                                            ci0, precond, tol=conv_tol, lindep=lindep,
+                                            max_cycle=max_cycle, max_space=max_space,
+                                            max_memory=max_memory, nroots=nroots,
+                                            verbose=verbose)
+            log.debug(f'Davidson: {logger.perf_counter() - t0} seconds')
+            if converged[0]:
+                log.note(f'FCI Davidson converged! Energy = {e[0]+ecore:.15g}')
+            else:
+                log.note('FCI Davidson did not converge according to current setting.')
+                log.note(f'Energy = {e[0]+ecore:.15g}')
         else:
-            log.note('FCI Davidson did not converge according to current setting.')
-            log.note(f'Energy = {e[0]+ecore:.15g}')
+            max_space = 12
+            converged, e, c = lib.rmm_diis1(lambda xs: [hop(x) for x in xs],
+                                            ci0, precond, tol=conv_tol, lindep=lindep,
+                                            max_cycle=max_cycle, max_space=max_space,
+                                            max_memory=max_memory, nroots=nroots,
+                                            verbose=verbose)
+            log.debug(f'RMM-DIIS: {logger.perf_counter() - t0} seconds')
+            if converged[0]:
+                log.note(f'FCI RMM-DIIS converged! Energy = {e[0]+ecore:.15g}')
+            else:
+                log.note('FCI RMM-DIIS did not converge according to current setting.')
+                log.note(f'Energy = {e[0]+ecore:.15g}')
         return e+ecore, c
     else:
         def hop(c):
@@ -315,20 +330,23 @@ def kernel(h1, g2, norb, nparticle, ecore=0, ci0=None, hdiag=None, nroots=1,
         if rdiag is None:
             rdiag = make_rdiag(r1, norb, nparticle)
         t0 = logger.perf_counter()
-        converged, e, c, f = cdavidson.davidson1(lambda xs: [list(t) for t in zip(*[hop(x) for x in xs])],
-                                                 ci0, f0.reshape(-1), hdiag, rdiag,
-                                                 tol=conv_tol, lindep=lindep,
-                                                 max_cycle=max_cycle, max_space=max_space,
-                                                 max_memory=max_memory, nroots=nroots,
-                                                 verbose=verbose,
-                                                 constraint_start_space=constraint_start_space,
-                                                 auto_bounds=auto_bounds, gtol=gtol, rtol=rtol)
-        log.debug(f'davidson: {logger.perf_counter() - t0} seconds')
-        if converged[0]:
-            log.note(f'C-FCI Davidson converged! Energy = {e[0]+ecore:.15g}')
+        if solver.lower() == 'davidson':
+            converged, e, c, f = cdavidson.davidson1(lambda xs: [list(t) for t in zip(*[hop(x) for x in xs])],
+                                                     ci0, f0.reshape(-1), hdiag, rdiag,
+                                                     tol=conv_tol, lindep=lindep,
+                                                     max_cycle=max_cycle, max_space=max_space,
+                                                     max_memory=max_memory, nroots=nroots,
+                                                     verbose=verbose,
+                                                     constraint_start_space=constraint_start_space,
+                                                     auto_bounds=auto_bounds, gtol=gtol, rtol=rtol)
+            log.debug(f'Davidson: {logger.perf_counter() - t0} seconds')
+            if converged[0]:
+                log.note(f'C-FCI Davidson converged! Energy = {e[0]+ecore:.15g}')
+            else:
+                log.note('C-FCI Davidson did not converge according to current setting.')
+                log.note(f'Energy = {e[0]+ecore:.15g}')
         else:
-            log.note('C-FCI Davidson did not converge according to current setting.')
-            log.note(f'Energy = {e[0]+ecore:.15g}')
+            raise NotImplementedError
         return e+ecore, c, f
 
 def energy(h1, g2, fcivec, norb, nparticle, ecore=0):
@@ -586,7 +604,7 @@ def FCI(mf, kernel=kernel, integrals=integrals, energy=energy, fci_verbose=logge
 
     ecore = mf.energy_nuc()
 
-    class CISolver():
+    class CISolver(lib.StreamObject):
         def __init__(self):
             # pyscf.fci uses 1e-10, and the default of lib.davidson1 is 1e-12.
             # Choose a tight convergence
@@ -607,6 +625,7 @@ def FCI(mf, kernel=kernel, integrals=integrals, energy=energy, fci_verbose=logge
             # TODO: adapt to the new symmetry code of CNEO-DFT.
             # TODO: implement the FCI code that utilizes wave function symmetry?
             self.symmetry = True
+            self.solver = 'davidson'
         def kernel(self, h1=h1, g2=g2, norb=norb, nparticle=nparticle,
                    ecore=ecore):
             self.e, self.c = kernel(h1, g2, norb, nparticle, ecore,
@@ -616,7 +635,8 @@ def FCI(mf, kernel=kernel, integrals=integrals, energy=energy, fci_verbose=logge
                                     max_cycle=self.max_cycle,
                                     max_space=self.max_space,
                                     max_memory=self.max_memory,
-                                    verbose=self.verbose)
+                                    verbose=self.verbose,
+                                    solver=self.solver)
             return self.e[0], self.c[0]
         def entropy(self, indices, fcivec=None, norb=norb, nparticle=nparticle):
             if fcivec is None:
@@ -716,6 +736,7 @@ def FCI(mf, kernel=kernel, integrals=integrals, energy=energy, fci_verbose=logge
                                                 max_space=self.max_space,
                                                 max_memory=self.max_memory,
                                                 verbose=self.verbose,
+                                                solver=self.solver,
                                                 constraint_start_space=self.constraint_start_space,
                                                 auto_bounds=self.auto_bounds,
                                                 gtol=self.gtol, rtol=self.rtol)
@@ -736,5 +757,7 @@ if __name__ == '__main__':
     mf.conv_tol_grad = 1e-7
     mf.kernel()
     print(f'HF energy: {mf.e_tot}', flush=True)
-    e1 = FCI(mf).kernel()[0]
+    e1 = FCI(mf).set(verbose=5).kernel()[0]
+    print(f'FCI energy: {e1}, difference with benchmark: {e1 - -0.4777448729395}')
+    e1 = FCI(mf).set(verbose=5, solver='rmm_diis').kernel()[0]
     print(f'FCI energy: {e1}, difference with benchmark: {e1 - -0.4777448729395}')
