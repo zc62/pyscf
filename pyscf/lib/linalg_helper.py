@@ -1718,8 +1718,6 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
         warnings.warn('rmm_diis1 ignores `pick`; roots follow the order of the initial guesses')
     if follow_state:
         warnings.warn('rmm_diis1 ignores `follow_state`')
-    if lessio:
-        warnings.warn('rmm_diis1 ignores `lessio`; all local steps use explicit matvecs')
 
     if precond is not None and not callable(precond):
         precond = make_diag_precond(precond)
@@ -1735,9 +1733,10 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
             raise LinearDependenceError('Initial guess has near-zero norm in rmm_diis1')
         xj /= numpy.sqrt(norm2)
 
-        dj = diis.DIIS(incore=_incore)
-        dj.space = max_space
-        dj.min_space = 1
+        if max_space >= 2:
+            dj = diis.DIIS(incore=_incore)
+            dj.space = max_space
+            dj.min_space = 1
 
         ax_hist = _hist_alloc(_incore) if not lessio else None
 
@@ -1761,16 +1760,23 @@ def rmm_diis1(aop, x0, precond=None, tol=1e-12, max_cycle=50, max_space=12,
         for icyc in range(max_cycle):
             e_last = ej
 
-            slot = dj._head if dj._head < dj.space else 0
-            xt = dj.update(xj, rj)
-            nd = dj.get_num_vec()
+            if max_space >= 2:
+                slot = dj._head if dj._head < dj.space else 0
+                if precond is not None:
+                    rj = precond(rj, ej, xj)
+                xt = dj.update(xj, rj)
+                nd = dj.get_num_vec()
 
-            if not lessio:
-                _hist_store(ax_hist, slot, axj)
-                coeffs = _diis_coeffs(dj, nd)
-                axt = _hist_combine(coeffs, ax_hist, nd).reshape(axj.shape)
+                if not lessio:
+                    _hist_store(ax_hist, slot, axj)
+                    coeffs = _diis_coeffs(dj, nd)
+                    axt = _hist_combine(coeffs, ax_hist, nd).reshape(axj.shape)
+                else:
+                    axt = aop([xt])[0]
             else:
-                axt = aop([xt])[0]
+                xt = xj
+                nd = 1
+                axt = axj
 
             xt, axt, norm = _normalize_x_ax(xt, axt, dot, lindep)
             if xt is None:

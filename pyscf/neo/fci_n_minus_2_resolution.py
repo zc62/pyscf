@@ -352,7 +352,7 @@ def kernel(h1, g2, norb, nparticle, ecore=0, ci0=None, hdiag=None, nroots=1,
            r1=None, rdiag=None, f0=None, conv_tol=1e-12, lindep=1e-14,
            max_cycle=250, max_space=24, max_memory=260000, verbose=logger.DEBUG1,
            constraint_start_space=4, auto_bounds=True, gtol=1e-12, rtol=1e-12,
-           solver='davidson'):
+           solver='davidson', max_cycle_warmup=0):
     if isinstance(verbose, logger.Logger):
         log = verbose
     else:
@@ -403,9 +403,24 @@ def kernel(h1, g2, norb, nparticle, ecore=0, ci0=None, hdiag=None, nroots=1,
                 log.note('FCI Davidson did not converge according to current setting.')
                 log.note(f'Energy = {e[0]+ecore:.15g}')
         else:
-            max_space = 12
+            if max_cycle_warmup > 0:
+                log.debug(f'Davidson warm up')
+                converged, e, c = lib.davidson1(lambda xs: [hop(x) for x in xs],
+                                                ci0, precond, tol=conv_tol, lindep=lindep,
+                                                max_cycle=max_cycle_warmup, max_space=max_space,
+                                                max_memory=max_memory, nroots=nroots,
+                                                verbose=verbose)
+                log.debug(f'Davidson: {logger.perf_counter() - t0} seconds')
+                if converged[0]:
+                    log.note(f'FCI Davidson converged! Energy = {e[0]+ecore:.15g}')
+                else:
+                    log.note('FCI Davidson did not converge according to current setting.')
+                    log.note(f'Energy = {e[0]+ecore:.15g}')
+                t0 = logger.perf_counter()
+            else:
+                c = ci0
             converged, e, c = lib.rmm_diis1(lambda xs: [hop(x) for x in xs],
-                                            ci0, precond, tol=conv_tol, lindep=lindep,
+                                            c, precond, tol=conv_tol, lindep=lindep,
                                             max_cycle=max_cycle, max_space=max_space,
                                             max_memory=max_memory, nroots=nroots,
                                             verbose=verbose)
