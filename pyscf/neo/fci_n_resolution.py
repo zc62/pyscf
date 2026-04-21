@@ -629,7 +629,6 @@ def FCI(mf, kernel=kernel, integrals=integrals, energy=energy, fci_verbose=logge
             # it can use more than 100 cycles. Set 250 as the default in case one might
             # want to experiment with other parameters that can sometimes cause >200 cycles.
             self.max_cycle = 250
-            self.max_cycle_warmup = 0 # number of Davidson warm-up cycles before RMM-DIIS
             self.max_space = 24 # double the default value. More memory, but better convergence
             self.max_memory = 260000 # 260000 is good for H2 cc-pV6Z & PB6H
             self.verbose = logger.DEBUG1
@@ -642,6 +641,7 @@ def FCI(mf, kernel=kernel, integrals=integrals, energy=energy, fci_verbose=logge
             # TODO: implement the FCI code that utilizes wave function symmetry?
             self.symmetry = True
             self.solver = 'davidson'
+            self.max_cycle_warmup = 0 # number of Davidson warm-up cycles before RMM-DIIS
         def kernel(self, h1=h1, g2=g2, norb=norb, nparticle=nparticle,
                    ecore=ecore):
             self.e, self.c = kernel(h1, g2, norb, nparticle, ecore,
@@ -652,7 +652,8 @@ def FCI(mf, kernel=kernel, integrals=integrals, energy=energy, fci_verbose=logge
                                     max_space=self.max_space,
                                     max_memory=self.max_memory,
                                     verbose=self.verbose,
-                                    solver=self.solver)
+                                    solver=self.solver,
+                                    max_cycle_warmup=self.max_cycle_warmup)
             return self.e[0], self.c[0]
         def entropy(self, indices, fcivec=None, norb=norb, nparticle=nparticle):
             if fcivec is None:
