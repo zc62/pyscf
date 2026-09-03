@@ -5,6 +5,7 @@ Nuclear Electronic Orbital Hartree-Fock (NEO-HF)
 '''
 
 import ctypes
+import numbers
 import numpy
 import warnings
 from scipy.special import erf
@@ -829,6 +830,22 @@ def generate_interactions(components, interaction_class, max_memory,
 
     return interactions
 
+
+def _component_factors(factor, components):
+    if isinstance(factor, dict):
+        factors = {t: factor[t] for t in components if t in factor}
+    elif isinstance(factor, (tuple, list)):
+        if len(factor) != 2:
+            raise ValueError('Component factors must contain electronic and nuclear values')
+        factors = {t: factor[1 if comp.is_nucleus else 0]
+                   for t, comp in components.items()}
+    else:
+        factors = dict.fromkeys(components, factor)
+    if not all(isinstance(x, numbers.Number) for x in factors.values()):
+        raise TypeError('Component factors must be numbers')
+    return factors
+
+
 def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
              diis=None, diis_start_cycle=None, level_shift_factor=None,
              damp_factor=None, fock_last=None, diis_pos='both', diis_type=3):
@@ -890,8 +907,10 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
                 and isinstance(dm[t], numpy.ndarray) and dm[t].ndim == 2:
             dm[t] = numpy.asarray((dm[t]*0.5,) * 2)
 
-    if 0 <= cycle < diis_start_cycle-1 and abs(damp_factor) > 1e-4 and fock_last is not None:
-        raise NotImplementedError('Damping for multi-component SCF is not yet implemented.')
+    if 0 <= cycle < diis_start_cycle-1 and fock_last is not None:
+        for t, factor in _component_factors(damp_factor, mf.components).items():
+            if abs(factor) > 1e-4:
+                f[t] = scf.hf.damping(f[t], fock_last[t], factor)
 
     if diis is not None and cycle >= diis_start_cycle:
         if isinstance(mf, neo.CDFT):
@@ -940,8 +959,15 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
             f = diis.update(s1e, dm, f)
             # WARNING: CDIIS only. Using EDIIS or ADIIS will cause errors
 
-    if abs(level_shift_factor) > 1e-4:
-        raise NotImplementedError('Level shift for multi-component SCF is not yet implemented.')
+    for t, factor in _component_factors(level_shift_factor, mf.components).items():
+        if abs(factor) > 1e-4:
+            comp = mf.components[t]
+            if f[t].ndim == 2:
+                dm_shift = dm[t] if comp.is_nucleus else dm[t] * .5
+                f[t] = scf.hf.level_shift(s1e[t], dm_shift, f[t], factor)
+            else:
+                f[t] = numpy.asarray([scf.hf.level_shift(s1e[t], dm_spin, f_spin, factor)
+                                      for dm_spin, f_spin in zip(dm[t], f[t])])
 
     # Post-DIIS CDFT optimization
     if isinstance(mf, neo.CDFT) and (diis_pos == 'post' or diis_pos == 'both'):

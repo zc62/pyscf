@@ -1835,7 +1835,7 @@ class SCF(lib.StreamObject):
         log.info('******** %s ********', self.__class__)
         log.info('method = %s', self.__class__.__name__)
         log.info('initial guess = %s', self.init_guess)
-        log.info('damping factor = %g', self.damp)
+        log.info('damping factor = %s', self.damp)
         log.info('level_shift factor = %s', self.level_shift)
         if isinstance(self.diis, lib.diis.DIIS):
             log.info('DIIS = %s', self.diis)
